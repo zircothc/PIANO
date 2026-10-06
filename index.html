@@ -28,8 +28,9 @@
 <body>
   <h1>Piano MIDI</h1>
   <div class="bar">
-    <button id="load">Cargar piano</button>
-    <span id="status">Pulsa «Cargar piano» para empezar.</span>
+    <label>Sonido <select id="sounds"><option>Buscando soundfonts…</option></select></label>
+    <button id="load">Cargar sonido</button>
+    <span id="status">Elige un sonido y pulsa «Cargar sonido».</span>
     <label>Teclado MIDI <select id="inputs"><option>Sin dispositivos</option></select></label>
     <label>Volumen <input id="vol" type="range" min="0" max="127" value="100"></label>
   </div>
@@ -37,14 +38,37 @@
 
 <script type="module">
 import { SplendidGrandPiano } from "https://cdn.jsdelivr.net/npm/smplr/+esm";
+import { WorkletSynthesizer } from "https://cdn.jsdelivr.net/npm/spessasynth_lib@4/+esm";
+
+const REPO = "zircothc/piano";           // usuario/repositorio
+const WORKLET = "https://cdn.jsdelivr.net/npm/spessasynth_lib@4/dist/spessasynth_processor.min.js";
 
 const $ = id => document.getElementById(id);
-const status = $("status"), sel = $("inputs"), loadBtn = $("load");
-let ctx, piano, midiAccess, currentInput = null;
-const playing = new Map();   // nota -> función stop
-const held = new Set();      // notas con tecla pulsada
-const sustained = new Set(); // notas soltadas con pedal puesto
+const status = $("status"), sel = $("inputs"), loadBtn = $("load"), soundSel = $("sounds");
+let ctx, engine, midiAccess, currentInput = null, workletReady = false, master;
+const held = new Set(), sustained = new Set();
 let pedal = false;
+
+// --- Lista de soundfonts del repo ---
+async function listSoundfonts() {
+  soundSel.innerHTML = '<option value="piano">Piano de cola (por defecto)</option>';
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/contents/`);
+    if (!r.ok) throw new Error(r.status);
+    const files = (await r.json()).filter(f => f.type === "file" && /\.(sf2|sf3|dls)$/i.test(f.name));
+    files.forEach(f => {
+      const o = document.createElement("option");
+      o.value = "sf:" + (f.download_url || f.name);
+      o.dataset.local = f.name;
+      o.textContent = f.name.replace(/\.(sf2|sf3|dls)$/i, "");
+      soundSel.appendChild(o);
+    });
+    if (!files.length) status.textContent = "No hay soundfonts (.sf2/.sf3/.dls) en el repo. Solo está el piano por defecto.";
+  } catch (e) {
+    status.textContent = "No pude listar el repo (límite de GitHub o sin conexión). Solo está el piano por defecto.";
+  }
+}
+listSoundfonts();
 
 // --- Teclado en pantalla (C2–C7) ---
 const FIRST = 36, LAST = 96, keyEls = {};
@@ -62,30 +86,47 @@ whites.forEach((n, i) => {
   }
 });
 
-// --- Sonido ---
-function noteOn(note, vel) {
-  if (!piano) return;
-  playing.get(note)?.();                // reinicia si ya sonaba
-  sustained.delete(note);
-  held.add(note);
-  const gain = vel / 127;
-  piano.output.setVolume?.(+$("vol").value);
-  playing.set(note, piano.start({ note, velocity: Math.max(1, vel) }));
-  keyEls[note]?.classList.add("on");
+// --- Motores de sonido (misma interfaz: on / off / stopAll / volume) ---
+function smplrEngine(piano) {
+  const stops = new Map();
+  return {
+    on: (n, v) => { stops.get(n)?.(); stops.set(n, piano.start({ note: n, velocity: Math.max(1, v) })); },
+    off: n => { stops.get(n)?.(); stops.delete(n); },
+    stopAll: () => { piano.stop(); stops.clear(); },
+    volume: v => piano.output.setVolume(v),
+    dispose: () => piano.stop()
+  };
 }
-function release(note) {
-  playing.get(note)?.();
-  playing.delete(note);
+function spessaEngine(synth) {
+  return {
+    on: (n, v) => synth.noteOn(0, n, Math.max(1, v)),
+    off: n => synth.noteOff(0, n),
+    stopAll: () => synth.stopAll?.(true),
+    volume: v => { master.gain.value = v / 100; },
+    dispose: () => { try { synth.disconnect(); } catch {} }
+  };
+}
+
+function noteOn(note, vel) {
+  if (!engine) return;
+  sustained.delete(note); held.add(note);
+  engine.on(note, vel);
+  keyEls[note]?.classList.add("on");
 }
 function noteOff(note) {
   held.delete(note);
   keyEls[note]?.classList.remove("on");
-  if (pedal) sustained.add(note); else release(note);
+  if (pedal) sustained.add(note); else engine?.off(note);
 }
 function setPedal(down) {
   pedal = down;
-  if (!down) { sustained.forEach(release); sustained.clear(); }
+  if (!down) { sustained.forEach(n => engine?.off(n)); sustained.clear(); }
 }
+function panic() {
+  held.clear(); sustained.clear(); engine?.stopAll();
+  document.querySelectorAll(".on").forEach(k => k.classList.remove("on"));
+}
+$("vol").oninput = () => engine?.volume(+$("vol").value);
 
 // --- MIDI ---
 function onMidi(e) {
@@ -93,7 +134,7 @@ function onMidi(e) {
   if (cmd === 0x90 && b > 0) noteOn(a, b);
   else if (cmd === 0x80 || (cmd === 0x90 && b === 0)) noteOff(a);
   else if (cmd === 0xb0 && a === 64) setPedal(b >= 64);
-  else if (cmd === 0xb0 && a === 123) { held.clear(); sustained.clear(); playing.forEach((st) => st()); playing.clear(); document.querySelectorAll(".on").forEach(k => k.classList.remove("on")); }
+  else if (cmd === 0xb0 && a === 123) panic();
 }
 function refreshInputs() {
   const prev = sel.value;
@@ -133,21 +174,47 @@ addEventListener("pointerup", up); addEventListener("pointercancel", up);
 
 // --- Carga ---
 loadBtn.onclick = async () => {
-  loadBtn.disabled = true;
-  status.textContent = "Cargando piano…";
+  loadBtn.disabled = soundSel.disabled = true;
+  const choice = soundSel.value, opt = soundSel.selectedOptions[0];
   try {
-    ctx = new AudioContext({ latencyHint: "interactive" });
+    panic();
+    if (!ctx) { ctx = new AudioContext({ latencyHint: "interactive" }); master = ctx.createGain(); master.connect(ctx.destination); }
     await ctx.resume();
-    piano = new SplendidGrandPiano(ctx);
-    await piano.load;
-    status.textContent = "Piano listo. Conecta tu teclado y toca.";
-    loadBtn.textContent = "Piano cargado";
-    await initMidi();
+    engine?.dispose(); engine = null;
+    if (choice === "piano") {
+      status.textContent = "Cargando piano…";
+      const piano = new SplendidGrandPiano(ctx);
+      await piano.load;
+      engine = smplrEngine(piano);
+    } else {
+      if (!workletReady) {
+        status.textContent = "Preparando sintetizador…";
+        const code = await (await fetch(WORKLET)).text();
+        await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+        workletReady = true;
+      }
+      status.textContent = "Descargando " + opt.textContent + "…";
+      // Primero la copia local (mismo dominio, más rápida); si falla, la de GitHub
+      let r = await fetch("./" + encodeURIComponent(opt.dataset.local)).catch(() => null);
+      if (!r || !r.ok) r = await fetch(choice.slice(3));
+      const buf = await r.arrayBuffer();
+      status.textContent = "Procesando soundfont…";
+      const synth = new WorkletSynthesizer(ctx);
+      synth.connect(master);
+      await synth.isReady;
+      await synth.soundBankManager.addSoundBank(buf, "main");
+      synth.programChange(0, 0);
+      engine = spessaEngine(synth);
+    }
+    engine.volume(+$("vol").value);
+    status.textContent = "Listo: " + opt.textContent + ". Toca.";
+    loadBtn.textContent = "Cargar sonido";
+    if (!midiAccess) await initMidi();
   } catch (err) {
     console.error(err);
-    status.textContent = "No se pudo cargar el piano. Revisa la conexión a internet.";
-    loadBtn.disabled = false;
+    status.textContent = "Error al cargar: " + (err.message || err);
   }
+  loadBtn.disabled = soundSel.disabled = false;
 };
 </script>
 </body>
